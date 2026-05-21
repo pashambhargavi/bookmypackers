@@ -1,0 +1,216 @@
+PROWIDER — MINI LEAD DISTRIBUTION SYSTEM
+Submission Explanation Document
+================================================================================
+
+SETUP INSTRUCTIONS
+──────────────────
+
+Prerequisites:
+  • Node.js 18+
+  • PostgreSQL 14+ (or any hosted PostgreSQL: Neon, Supabase, Railway)
+
+Steps:
+
+  1. Clone repository
+       git clone <repo-url>
+       cd prowider-lead-distribution
+
+  2. Install dependencies
+       npm install
+
+  3. Set environment variable
+       cp .env.example .env.local
+       # Edit .env.local → set DATABASE_URL to your PostgreSQL connection string
+       # Example: DATABASE_URL="postgresql://user:pass@localhost:5432/prowider_db"
+
+  4. Initialize database (one command does everything)
+       npm run setup
+       # This runs: prisma generate → prisma db push → node prisma/seed.js
+       # Seeds: 3 services, 8 providers, allocation states
+
+  5. Start development server
+       npm run dev
+       # App runs at http://localhost:3000
+
+  6. Visit pages:
+       /               → Home / system overview
+       /request-service → Customer lead submission form
+       /dashboard      → Real-time provider dashboard
+       /test-tools     → Webhook & concurrency testing panel
+
+Deployment (Vercel + Neon):
+  1. Create a free PostgreSQL database at neon.tech
+  2. Run: vercel (follow prompts)
+  3. Set DATABASE_URL in Vercel dashboard → Environment Variables
+  4. Set Vercel build command to:
+       prisma generate && prisma db push && node prisma/seed.js && next build
+
+================================================================================
+
+ALLOCATION ALGORITHM
+────────────────────
+
+Business Rules Implemented:
+
+  Service 1 → Mandatory: Provider 1 | Pool: Providers 2, 3, 4
+  Service 2 → Mandatory: Provider 5 | Pool: Providers 6, 7, 8
+  Service 3 → Mandatory: Provider 1 + Provider 4 | Pool: Providers 2, 3, 5, 6, 7, 8
+
+  Each lead is assigned to exactly 3 providers total.
+
+Algorithm (per new lead):
+
+  Step 1 — Mandatory assignment
+    All mandatory providers for the service are assigned first.
+    If a mandatory provider has exhausted their monthly quota (10 leads),
+    they are skipped (graceful degradation, not a hard failure).
+
+  Step 2 — Round-robin fill from pool
+    The remaining provider slots (up to 3 total) are filled from the
+    service's pool using a persistent round-robin index.
+
+    The index is stored in the `allocation_states` PostgreSQL table as:
+      { poolIndex: 2, pool: [2, 3, 4] }
+
+    Example: If poolIndex=1 and pool=[2,3,4]:
+      → Next provider is pool[1] = Provider 3
+      → poolIndex advances to 2 for the next lead
+      → This persists to DB so server restarts don't reset fairness
+
+  Step 3 — Quota enforcement
+    Providers at quota are skipped in the round-robin loop.
+    The loop iterates a maximum of pool.length × 2 times to prevent
+    infinite loops when all pool members are quota-exhausted.
+
+  Step 4 — Persist new index
+    The updated poolIndex is written back in the same transaction
+    that creates the lead assignments.
+
+Why this is provably fair:
+  • The poolIndex is never reset arbitrarily — only via webhook quota reset
+  • Providers rotate in deterministic order: 2→3→4→2→3→4→...
+  • No randomness anywhere in the allocation path
+  • The state survives server restarts (stored in PostgreSQL, not RAM)
+
+================================================================================
+
+HOW CONCURRENCY WAS HANDLED
+────────────────────────────
+
+The Problem:
+  If 10 leads are submitted simultaneously (e.g., from Promise.all()),
+  naive code would have all 10 transactions read the same poolIndex,
+  all select Provider 2, and all attempt to increment the same quota.
+  Result: corrupt data, duplicate assignments, over-quota violations.
+
+The Solution: PostgreSQL Row-Level Locking + Serializable Transactions
+
+  Every lead allocation runs inside a Prisma transaction with:
+    isolationLevel: 'Serializable'
+
+  Inside the transaction, two critical rows are locked with FOR UPDATE:
+
+    1. The allocation_states row for this service:
+         SELECT * FROM allocation_states WHERE "serviceId" = $1 FOR UPDATE
+
+       This ensures only ONE transaction at a time can read/update the
+       poolIndex for a given service. All other concurrent transactions
+       for the same service wait in a queue until the lock is released.
+
+    2. The candidate provider rows:
+         SELECT * FROM providers WHERE id = ANY($1) FOR UPDATE
+
+       This prevents concurrent quota increments from exceeding the limit.
+
+  The flow under concurrency:
+    Lead A arrives → acquires lock → reads poolIndex=0 → assigns Provider 2
+                  → writes poolIndex=1 → commits → releases lock
+    Lead B (was waiting) → acquires lock → reads poolIndex=1 → assigns Provider 3
+                         → writes poolIndex=2 → commits
+    Lead C → assigns Provider 4 → writes poolIndex=0 (wraps)
+
+  Result: Serial, correct allocation even when submitted simultaneously.
+
+  Additional safety net:
+    The lead_assignments table has a DB-level unique constraint:
+      @@unique([leadId, providerId])
+    
+    This means even if two transactions somehow assigned the same provider
+    to the same lead, the second INSERT would fail at the DB level, not
+    silently corrupt data.
+
+================================================================================
+
+HOW WEBHOOK IDEMPOTENCY IS ENSURED
+────────────────────────────────────
+
+The Problem:
+  Payment gateways retry failed webhooks. If a quota reset is triggered
+  twice due to network issues or retry logic, providers would be
+  double-reset (though in this case harmless, in financial systems
+  this causes serious issues like double-credits).
+
+The Solution: EventId Deduplication Table
+
+  Every webhook call must include a unique `eventId` (a UUID).
+
+  Before processing any webhook:
+
+    const existing = await prisma.webhookEvent.findUnique({
+      where: { eventId }
+    });
+    if (existing) {
+      return { idempotent: true, message: "Already processed" };
+      // No action taken — return 200 so the gateway stops retrying
+    }
+
+  If the event is new, it is processed inside a transaction that
+  ALSO creates the WebhookEvent record:
+
+    await tx.webhookEvent.create({ data: { eventId, eventType, payload } });
+    // Then do the actual work (reset quotas, etc.)
+
+  Layer 1 — Application check: findUnique before processing
+  Layer 2 — Database constraint: webhook_events.eventId is UNIQUE
+             If two concurrent requests with the same eventId race,
+             only one INSERT will succeed; the other gets a DB error
+             and is treated as a duplicate.
+
+  The webhook_events table also serves as a full audit log:
+    • Who called the webhook (eventType)
+    • When it was processed (processedAt)
+    • What payload was sent (payload JSON)
+
+  Testing idempotency:
+    The /test-tools page has a button "Idempotency Test (3× same ID)"
+    which fires 3 simultaneous fetch() calls with identical eventId.
+    Expected result: 1 processes successfully, 2 return idempotent=true.
+
+================================================================================
+
+REAL-TIME DASHBOARD
+───────────────────
+
+Implementation: Server-Sent Events (SSE)
+
+  When a provider's lead is created:
+    → The POST /api/leads handler calls broadcastLeadUpdate(data)
+    → This writes to all active SSE response streams
+    → The dashboard React component receives the event
+    → It re-fetches provider data and flashes the affected provider cards
+
+  The SSE connection is at: GET /api/leads/stream
+  Heartbeat every 30 seconds keeps the connection alive through proxies.
+  The browser auto-reconnects SSE on disconnection.
+
+================================================================================
+
+DATABASE DESIGN SUMMARY
+────────────────────────
+
+  services         — 3 rows (Service 1, 2, 3)
+  providers        — 8 rows with monthlyQuota + leadsReceived counters
+  leads            — customer enquiries; UNIQUE(phone, serviceId) enforced at DB
+  lead_assignments — junction table; UNIQUE(leadId, providerId) prevents dupes
+  allocation_states — one row per service; stores JSON poolIndex for round-robin
+  webhook_events   — idempotency log; UNIQUE(eventId)

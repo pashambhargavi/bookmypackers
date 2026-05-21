@@ -1,0 +1,80 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Service {
+  id    Int    @id @default(autoincrement())
+  name  String @unique
+  leads Lead[]
+
+  @@map("services")
+}
+
+model Provider {
+  id             Int              @id @default(autoincrement())
+  name           String           @unique
+  monthlyQuota   Int              @default(10)
+  leadsReceived  Int              @default(0)
+  allocationIndex Int             @default(0) // For round-robin tracking
+  leadAssignments LeadAssignment[]
+
+  @@map("providers")
+}
+
+model Lead {
+  id          Int              @id @default(autoincrement())
+  name        String
+  phone       String
+  city        String
+  description String
+  serviceId   Int
+  service     Service          @relation(fields: [serviceId], references: [id])
+  createdAt   DateTime         @default(now())
+  assignments LeadAssignment[]
+
+  // Unique constraint: same phone + same service not allowed
+  @@unique([phone, serviceId])
+  @@map("leads")
+}
+
+model LeadAssignment {
+  id         Int      @id @default(autoincrement())
+  leadId     Int
+  providerId Int
+  assignedAt DateTime @default(now())
+  lead       Lead     @relation(fields: [leadId], references: [id])
+  provider   Provider @relation(fields: [providerId], references: [id])
+
+  @@unique([leadId, providerId])
+  @@map("lead_assignments")
+}
+
+// Tracks allocation state per service for fair round-robin
+model AllocationState {
+  id        Int      @id @default(autoincrement())
+  serviceId Int      @unique
+  // JSON string storing the round-robin queue/index per pool
+  stateJson String   @default("{}")
+  updatedAt DateTime @updatedAt
+
+  @@map("allocation_states")
+}
+
+// Webhook idempotency tracking
+model WebhookEvent {
+  id          Int      @id @default(autoincrement())
+  eventId     String   @unique
+  eventType   String
+  processedAt DateTime @default(now())
+  payload     String
+
+  @@map("webhook_events")
+}
